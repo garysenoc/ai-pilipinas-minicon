@@ -1,0 +1,342 @@
+"""
+Technique 6: Conversation Knowledge Graph Memory (LCEL Pattern)
+================================================================
+
+This technique builds a knowledge graph from the conversation, storing
+relationships between entities. It's more sophisticated than entity memory
+as it captures how entities relate to each other. Uses modern LCEL pattern.
+
+Pros:
+- Captures relationships between entities
+- Can answer complex queries about relationships
+- Structured representation of knowledge
+- Good for complex domains
+- Uses modern LangChain v1.0+ patterns (no deprecation warnings)
+
+Cons:
+- More complex to implement
+- Requires relationship extraction
+- May be overkill for simple conversations
+- Requires graph storage
+
+Use Case: Complex domains where relationships matter (e.g., organizational
+charts, product catalogs, social networks, technical documentation).
+"""
+
+from langchain_openai import ChatOpenAI
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_community.graphs import NetworkxEntityGraph
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import Runnable
+from dotenv import load_dotenv
+import os
+import sys
+from typing import Dict, List
+import json
+import re
+
+# Add parent directory to path for utils
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.token_counter import (
+    count_tokens, 
+    count_messages_tokens,
+    print_token_stats,
+    print_token_summary
+)
+
+load_dotenv()
+
+# Store for chat message histories and knowledge graphs
+store: Dict[str, BaseChatMessageHistory] = {}
+kg_store: Dict[str, NetworkxEntityGraph] = {}  # session_id -> graph
+
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    """Get or create chat message history for a session."""
+    if session_id not in store:
+        store[session_id] = ChatMessageHistory()
+    return store[session_id]
+
+def get_kg(session_id: str) -> NetworkxEntityGraph:
+    """Get or create knowledge graph for a session."""
+    if session_id not in kg_store:
+        kg_store[session_id] = NetworkxEntityGraph()
+    return kg_store[session_id]
+
+def extract_kg_triples(llm: ChatOpenAI, conversation_text: str) -> List[tuple]:
+    """Extract knowledge graph triples from conversation."""
+    prompt = f"""Extract knowledge graph triples (subject, predicate, object) from the following conversation.
+Return a JSON array of triples in the format: [["subject", "predicate", "object"], ...]
+
+Conversation:
+{conversation_text}
+
+Return only valid JSON array:"""
+
+    try:
+        response = llm.invoke(prompt)
+        content = response.content if hasattr(response, 'content') else str(response)
+        
+        # Extract JSON from response
+        json_match = re.search(r'\[.*\]', content, re.DOTALL)
+        if json_match:
+            triples = json.loads(json_match.group())
+        else:
+            triples = json.loads(content)
+        
+        return triples if isinstance(triples, list) else []
+    except:
+        return []
+
+def format_kg_info(graph: NetworkxEntityGraph) -> str:
+    """Format knowledge graph information for the prompt."""
+    try:
+        if hasattr(graph, 'graph'):
+            nx_graph = graph.graph
+        elif hasattr(graph, '_graph'):
+            nx_graph = graph._graph
+        else:
+            import networkx as nx
+            if isinstance(graph, nx.Graph):
+                nx_graph = graph
+            else:
+                return "No knowledge graph information available."
+        
+        nodes = list(nx_graph.nodes())
+        edges = list(nx_graph.edges(data=True))
+        
+        if not nodes:
+            return "No knowledge graph information available."
+        
+        info = "Knowledge Graph Information:\n"
+        info += f"Entities: {', '.join(nodes)}\n\n"
+        info += "Relationships:\n"
+        for edge in edges:
+            if len(edge) >= 3 and isinstance(edge[2], dict):
+                relation = edge[2].get('relation', 'related')
+            else:
+                relation = 'related'
+            info += f"  - {edge[0]} {relation} {edge[1]}\n"
+        
+        return info
+    except:
+        return "No knowledge graph information available."
+
+def create_kg_memory_agent():
+    """Create an agent with knowledge graph memory using LCEL pattern."""
+    
+    # Initialize the LLM for conversation
+    llm = ChatOpenAI(
+        model="gpt-4o",
+        temperature=0.7,
+        openai_api_key=os.getenv("OPENAI_API_KEY")
+    )
+    
+    # LLM for KG extraction
+    kg_llm = ChatOpenAI(
+        model="gpt-4o",
+        temperature=0,
+        openai_api_key=os.getenv("OPENAI_API_KEY")
+    )
+    
+    # Create a custom Runnable that handles KG extraction
+    class KGMemoryChain(Runnable):
+        """Custom Runnable that handles knowledge graph extraction with message history."""
+        
+        def invoke(self, inputs: Dict, config: Dict = None):
+            """Invoke with knowledge graph extraction and message history."""
+            session_id = config.get("configurable", {}).get("session_id", "default") if config else "default"
+            user_input = inputs.get("input", "")
+            history = get_session_history(session_id)
+            graph = get_kg(session_id)
+            
+            # Build conversation text for KG extraction
+            conversation_text = "\n".join([
+                f"{'Human' if isinstance(m, HumanMessage) else 'AI'}: {m.content}"
+                for m in history.messages[-5:]  # Last 5 messages for context
+            ])
+            conversation_text += f"\nHuman: {user_input}"
+            
+            # Extract KG triples
+            triples = extract_kg_triples(kg_llm, conversation_text)
+            
+            # Add triples to graph
+            for triple in triples:
+                if len(triple) >= 3:
+                    subject, predicate, obj = str(triple[0]), str(triple[1]), str(triple[2])
+                    try:
+                        # NetworkxEntityGraph wraps a NetworkX graph
+                        if hasattr(graph, 'graph'):
+                            nx_graph = graph.graph
+                        elif hasattr(graph, '_graph'):
+                            nx_graph = graph._graph
+                        else:
+                            import networkx as nx
+                            if isinstance(graph, nx.Graph):
+                                nx_graph = graph
+                            else:
+                                # Try to get the underlying graph
+                                nx_graph = getattr(graph, 'get_graph', lambda: None)()
+                                if nx_graph is None:
+                                    continue
+                        
+                        if nx_graph is not None:
+                            nx_graph.add_node(subject)
+                            nx_graph.add_node(obj)
+                            nx_graph.add_edge(subject, obj, relation=predicate)
+                    except Exception as e:
+                        # Silently continue if graph update fails
+                        pass
+            
+            # Format KG information
+            kg_info = format_kg_info(graph)
+            
+            # Create prompt with KG information
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", f"""You are a helpful AI assistant. You have access to knowledge graph information from the conversation.
+
+{kg_info}
+
+Use this information to provide accurate and personalized responses."""),
+                MessagesPlaceholder(variable_name="history"),
+                ("human", "{input}")
+            ])
+            
+            # Invoke prompt and LLM
+            messages = prompt.invoke({
+                "history": history.messages if history.messages else [],
+                "input": user_input
+            })
+            response = llm.invoke(messages)
+            return response
+    
+    # Create the custom chain
+    custom_chain = KGMemoryChain()
+    
+    # Wrap with message history
+    chain_with_history = RunnableWithMessageHistory(
+        custom_chain,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="history",
+    )
+    
+    return chain_with_history
+
+def demonstrate_kg_memory():
+    """Demonstrate knowledge graph memory using LCEL pattern."""
+    print("=" * 60)
+    print("Technique 6: Conversation Knowledge Graph Memory (LCEL Pattern)")
+    print("=" * 60)
+    print("Using modern LangChain v1.0+ patterns with RunnableWithMessageHistory")
+    print()
+    
+    chain = create_kg_memory_agent()
+    session_id = "demo_session"
+    config = {"configurable": {"session_id": session_id}}
+    
+    # Simulate a conversation with relationships
+    conversations = [
+        "Alice is the CEO of TechCorp",
+        "Bob works for Alice at TechCorp",
+        "TechCorp is located in San Francisco",
+        "Alice lives in San Francisco",
+        "Bob is a software engineer",
+        "Who does Bob work for?",
+        "Where is TechCorp located?",
+        "Who is the CEO of TechCorp?"
+    ]
+    
+    total_input_tokens = 0
+    total_output_tokens = 0
+    
+    for i, user_input in enumerate(conversations, 1):
+        print(f"User: {user_input}")
+        
+        # Count input tokens (user message + history + KG)
+        input_tokens = count_tokens(user_input)
+        history = get_session_history(session_id)
+        if history.messages:
+            input_tokens += count_messages_tokens(history.messages)
+        # Add KG tokens (rough estimate)
+        graph = get_kg(session_id)
+        kg_info = format_kg_info(graph)
+        input_tokens += count_tokens(kg_info)
+        total_input_tokens += input_tokens
+        
+        response = chain.invoke(
+            {"input": user_input},
+            config=config
+        )
+        print(f"Agent: {response.content}")
+        
+        # Count output tokens
+        output_tokens = count_tokens(response.content)
+        total_output_tokens += output_tokens
+        
+        # Count current memory tokens (history + KG)
+        history = get_session_history(session_id)
+        memory_tokens = count_messages_tokens(history.messages) if history.messages else 0
+        graph = get_kg(session_id)
+        kg_info = format_kg_info(graph)
+        memory_tokens += count_tokens(kg_info)
+        
+        print_token_stats(input_tokens, output_tokens, memory_tokens)
+        print()
+    
+    # Show the knowledge graph
+    print("\n" + "-" * 60)
+    print("Knowledge Graph:")
+    print("-" * 60)
+    graph = get_kg(session_id)
+    # NetworkxEntityGraph wraps a NetworkX graph
+    try:
+        # Try to get the underlying NetworkX graph
+        if hasattr(graph, 'graph'):
+            nx_graph = graph.graph
+        elif hasattr(graph, '_graph'):
+            nx_graph = graph._graph
+        else:
+            # Try direct access
+            import networkx as nx
+            if isinstance(graph, nx.Graph):
+                nx_graph = graph
+            else:
+                raise AttributeError("Cannot access graph")
+        
+        nodes = list(nx_graph.nodes())
+        edges = list(nx_graph.edges(data=True))
+        
+        print("Nodes (Entities):", nodes if nodes else "No entities yet")
+        print("\nEdges (Relationships):")
+        if edges:
+            for edge in edges:
+                if len(edge) >= 3 and isinstance(edge[2], dict):
+                    relation = edge[2].get('relation', 'related')
+                else:
+                    relation = 'related'
+                print(f"  {edge[0]} --[{relation}]--> {edge[1]}")
+        else:
+            print("  No relationships yet")
+    except Exception as e:
+        print(f"Graph structure: {type(graph).__name__}")
+        print(f"(Unable to display graph details: {e})")
+    print()
+    
+    # Show total token usage
+    history = get_session_history(session_id)
+    final_memory = count_messages_tokens(history.messages) if history.messages else 0
+    graph = get_kg(session_id)
+    kg_info = format_kg_info(graph)
+    final_memory += count_tokens(kg_info)
+    
+    print_token_summary(
+        total_input_tokens, 
+        total_output_tokens, 
+        final_memory
+    )
+
+if __name__ == "__main__":
+    demonstrate_kg_memory()
